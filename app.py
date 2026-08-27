@@ -32,6 +32,7 @@ NTP_SAMPLES = 3
 
 SCRIPT_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 LOG_FILE = SCRIPT_DIR / "app_log.txt"
+_LOG_LOCK = threading.Lock()
 
 TEMPLATES = {
     "纯编号": "{numbers}",
@@ -40,6 +41,18 @@ TEMPLATES = {
     "我想要": "我想要 {numbers}",
     "老板": "老板 {numbers} 谢谢",
 }
+
+
+def _write_log(message: str) -> None:
+    """Append a timestamped diagnostic line beside the script/EXE."""
+    try:
+        stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        with _LOG_LOCK:
+            with LOG_FILE.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"{stamp} {message.rstrip()}\n")
+    except Exception:
+        # Diagnostics must never break grabbing or calibration.
+        pass
 
 
 def _hidden_process_options() -> dict:
@@ -256,8 +269,9 @@ def _wechat_pids() -> set[int]:
                     pids.add(int(row[1]))
                 except ValueError:
                     pass
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_log(f"WECHAT tasklist failed: {exc!r}")
+    _write_log(f"WECHAT matched PIDs: {sorted(pids)}")
     return pids
 
 
@@ -404,27 +418,39 @@ def get_wechat_ports() -> list[int]:
             m = re.search(r":(\d+)$", local)
             if m:
                 ports.add(int(m.group(1)))
-    except Exception:
-        pass
-    return sorted(ports)
+                _write_log(f"WECHAT netstat match: {line.strip()}")
+    except Exception as exc:
+        _write_log(f"WECHAT netstat failed: {exc!r}")
+    result = sorted(ports)
+    _write_log(f"WECHAT matched TCP ports: {result}")
+    return result
 
 
 class PacketCapture:
     """Windows built-in PktMon real-time capture; no WinDump/Npcap install needed."""
 
-    TS_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})\.(\d+)")
+    # PktMon formatting varies by Windows release. Accept a date/component
+    # prefix and either a dot or colon before fractional seconds.
+    TS_RE = re.compile(r"(?<!\d)(\d{1,2}):(\d{2}):(\d{2})[\.:](\d+)")
 
     def __init__(self, ports: list[int]):
         self._ports = ports[:32]
         self._proc: subprocess.Popen | None = None
         self._lines: list[tuple[float, str]] = []
+        self._raw_line_count = 0
+        self._parsed_line_count = 0
         self._lock = threading.Lock()
 
     def _run_pktmon(self, args: list[str], check=True):
-        return subprocess.run(
+        result = subprocess.run(
             ["pktmon", *args], capture_output=True, text=True, errors="ignore",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=8, check=check
         )
+        _write_log(
+            f"PKTMON command={args!r} rc={result.returncode} "
+            f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}"
+        )
+        return result
 
     def start(self):
         if SYSTEM != "Windows":
@@ -443,6 +469,7 @@ class PacketCapture:
                 raise RuntimeError(f"添加 PktMon 端口过滤失败: {port}\n{r.stderr or r.stdout}")
 
         cmd = ["pktmon", "start", "--capture", "--comp", "nics", "--log-mode", "real-time", "--flags", "0x010"]
+        _write_log(f"PKTMON starting realtime capture: {cmd!r}; ports={self._ports}")
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore",
             bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -453,7 +480,7 @@ class PacketCapture:
             raise RuntimeError("PktMon 未能启动，请确认使用管理员权限运行")
 
     def _line_to_epoch(self, line: str) -> float | None:
-        m = self.TS_RE.match(line.strip())
+        m = self.TS_RE.search(line)
         if not m:
             return None
         hh, mm, ss, frac = m.groups()
@@ -473,14 +500,28 @@ class PacketCapture:
         try:
             assert self._proc and self._proc.stdout
             for line in self._proc.stdout:
+                clean_line = line.rstrip()
                 ts = self._line_to_epoch(line)
-                if ts is not None:
-                    with self._lock:
+                with self._lock:
+                    self._raw_line_count += 1
+                    if ts is not None:
+                        self._parsed_line_count += 1
                         self._lines.append((ts, line.rstrip()))
                         if len(self._lines) > 5000:
                             self._lines = self._lines[-3000:]
-        except Exception:
-            pass
+                _write_log(f"PKTMON raw parsed={ts is not None}: {clean_line[:2000]}")
+        except Exception as exc:
+            _write_log(f"PKTMON reader failed: {exc!r}")
+
+    def diagnostic_summary(self) -> str:
+        with self._lock:
+            raw_count = self._raw_line_count
+            parsed_count = self._parsed_line_count
+        if raw_count == 0:
+            return "PktMon 无原始输出"
+        if parsed_count == 0:
+            return f"PktMon 有 {raw_count} 行输出但时间戳均未识别"
+        return f"PktMon 原始 {raw_count} 行，已解析 {parsed_count} 行"
 
     def first_packet_after(self, since_ts: float, max_delay: float = 1.5) -> tuple[float | None, str | None]:
         deadline = time.time() + max_delay
@@ -493,9 +534,14 @@ class PacketCapture:
                 if -5 <= delay_ms <= max_delay * 1000:
                     return delay_ms, line
             time.sleep(0.02)
+        _write_log(
+            f"PKTMON no packet after send_ts={since_ts:.6f}; "
+            f"timeout={max_delay:.3f}s; {self.diagnostic_summary()}"
+        )
         return None, None
 
     def stop(self):
+        _write_log(f"PKTMON stopping; {self.diagnostic_summary()}")
         try:
             subprocess.run(["pktmon", "stop"], capture_output=True, text=True,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
@@ -817,7 +863,15 @@ class CalibrateTab(ttk.Frame):
             messagebox.showwarning("提示", "测试轮数格式错误"); return
         self._results = []; self._recommended_ms = 0; self._running = True
         self._result_text.delete("1.0", "end")
-        self._result_text.insert("end", f"抓包测试 {self._total} 轮（前 {self._drop} 轮热身）\n监控端口: {', '.join(map(str, self._wechat_ports))}\n抓包后端: Windows 内置 PktMon\n\n")
+        _write_log("=" * 20 + " calibration session started " + "=" * 20)
+        _write_log(f"APP executable={sys.executable!r}; log={str(LOG_FILE)!r}")
+        self._result_text.insert(
+            "end",
+            f"抓包测试 {self._total} 轮（前 {self._drop} 轮热身）\n"
+            f"监控端口: {', '.join(map(str, self._wechat_ports))}\n"
+            f"抓包后端: Windows 内置 PktMon\n"
+            f"诊断日志: {LOG_FILE}\n\n",
+        )
         self._start_btn.config(state="disabled"); self._stop_btn.config(state="normal")
         self._copy_btn.config(state="disabled"); self._apply_btn.config(state="disabled")
         try:
@@ -831,6 +885,11 @@ class CalibrateTab(ttk.Frame):
         msg = self._msg_var.get().strip() or "测"
         for r in range(1, self._total + 1):
             if not self._running: break
+            current_ports = get_wechat_ports()
+            if set(current_ports) != set(self._wechat_ports):
+                _write_log(
+                    f"ROUND {r}: TCP ports changed; capture={self._wechat_ports}, current={current_ports}"
+                )
             self.after(0, lambda r=r: self._status.config(text=f"第 {r}/{self._total} 轮", fg="#007700"))
             target_go = time.time() + 3.0
             while self._running and time.time() < target_go:
@@ -851,7 +910,8 @@ class CalibrateTab(ttk.Frame):
                 tag = "计入" if r > self._drop else "热身"
                 self._append(f"#{r:02d}: {delay_ms:6.1f}ms  ← {tag}\n")
             else:
-                self._append(f"#{r:02d}: 未找到发送包\n")
+                detail = self._capture.diagnostic_summary() if self._capture else "抓包器不可用"
+                self._append(f"#{r:02d}: 未找到发送包（{detail}）\n")
             time.sleep(1.0)
         if self._capture: self._capture.stop()
         if self._running: self._show_summary()
