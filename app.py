@@ -440,6 +440,9 @@ class PacketCapture:
         self._raw_line_count = 0
         self._parsed_line_count = 0
         self._lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._reader_thread: threading.Thread | None = None
+        self._stopped = False
 
     def _run_pktmon(self, args: list[str], check=True):
         result = subprocess.run(
@@ -475,7 +478,8 @@ class PacketCapture:
             encoding="utf-8", errors="replace",
             bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
-        threading.Thread(target=self._read, daemon=True, name="pktmon-reader").start()
+        self._reader_thread = threading.Thread(target=self._read, daemon=True, name="pktmon-reader")
+        self._reader_thread.start()
         time.sleep(0.8)
         if self._proc.poll() is not None:
             raise RuntimeError("PktMon 未能启动，请确认使用管理员权限运行")
@@ -524,51 +528,60 @@ class PacketCapture:
             return f"PktMon 有 {raw_count} 行输出但时间戳均未识别"
         return f"PktMon 原始 {raw_count} 行，已解析 {parsed_count} 行"
 
-    def first_packet_after(
-        self,
-        since_ts: float,
-        packet_window: float = 1.5,
-        output_wait: float = 15.0,
+    @staticmethod
+    def _is_tx_line(line: str) -> bool:
+        return re.search(r"\bTx\b", line, re.IGNORECASE) is not None
+
+    def packet_after(
+        self, since_ts: float, packet_window: float = 1.5
     ) -> tuple[float | None, str | None]:
-        # PktMon can buffer redirected real-time output for several seconds.
-        # Wait for that output without widening the valid packet-time window.
-        deadline = time.time() + output_wait
-        while time.time() < deadline:
-            with self._lock:
-                candidates = [(ts, line) for ts, line in self._lines if ts >= since_ts - 0.005]
-            if candidates:
-                ts, line = min(candidates, key=lambda x: x[0])
-                delay_ms = (ts - since_ts) * 1000.0
-                if -5 <= delay_ms <= packet_window * 1000:
-                    return delay_ms, line
-            time.sleep(0.02)
-        _write_log(
-            f"PKTMON no packet after send_ts={since_ts:.6f}; "
-            f"packet_window={packet_window:.3f}s; output_wait={output_wait:.3f}s; "
-            f"{self.diagnostic_summary()}"
-        )
-        return None, None
+        """Match a captured outbound packet by its embedded event timestamp."""
+        with self._lock:
+            candidates = [
+                (ts, line)
+                for ts, line in self._lines
+                if since_ts - 0.005 <= ts <= since_ts + packet_window
+                and self._is_tx_line(line)
+            ]
+        if not candidates:
+            _write_log(
+                f"PKTMON no Tx packet for send_ts={since_ts:.6f}; "
+                f"packet_window={packet_window:.3f}s; {self.diagnostic_summary()}"
+            )
+            return None, None
+        ts, line = min(candidates, key=lambda item: item[0])
+        delay_ms = (ts - since_ts) * 1000.0
+        _write_log(f"PKTMON matched send_ts={since_ts:.6f}; delay_ms={delay_ms:.3f}; line={line}")
+        return delay_ms, line
 
     def stop(self):
-        _write_log(f"PKTMON stopping; {self.diagnostic_summary()}")
-        try:
-            subprocess.run(["pktmon", "stop"], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace",
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
-        except Exception:
-            pass
-        try:
-            subprocess.run(["pktmon", "filter", "remove"], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace",
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
-        except Exception:
-            pass
-        if self._proc:
+        with self._stop_lock:
+            if self._stopped:
+                return
+            _write_log(f"PKTMON stopping and flushing; {self.diagnostic_summary()}")
             try:
-                self._proc.terminate()
-            except Exception:
-                pass
+                self._run_pktmon(["stop"], check=False)
+            except Exception as exc:
+                _write_log(f"PKTMON stop command failed: {exc!r}")
+            if self._proc:
+                try:
+                    self._proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    _write_log("PKTMON realtime process did not exit after stop; terminating")
+                    self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=2)
+                    except Exception:
+                        pass
+            if self._reader_thread:
+                self._reader_thread.join(timeout=3)
+            try:
+                self._run_pktmon(["filter", "remove"], check=False)
+            except Exception as exc:
+                _write_log(f"PKTMON filter cleanup failed: {exc!r}")
+            _write_log(f"PKTMON flush complete; {self.diagnostic_summary()}")
             self._proc = None
+            self._stopped = True
 
 
 class GrabberTab(ttk.Frame):
@@ -894,6 +907,7 @@ class CalibrateTab(ttk.Frame):
 
     def _run_rounds(self):
         msg = self._msg_var.get().strip() or "测"
+        sent_rounds: list[tuple[int, float]] = []
         for r in range(1, self._total + 1):
             if not self._running: break
             current_ports = get_wechat_ports()
@@ -914,23 +928,35 @@ class CalibrateTab(ttk.Frame):
                 self.sender.enter_only()
             except Exception as e:
                 self._append(f"#{r:02d}: 发送失败: {e}\n"); continue
-            self.after(0, lambda r=r: self._status.config(text=f"第 {r}/{self._total} 轮 — 等待网络包…", fg="#cc6600"))
-            delay_ms, _line = self._capture.first_packet_after(fire_time, 1.5) if self._capture else (None, None)
+            sent_rounds.append((r, fire_time))
+            _write_log(f"ROUND {r}: message sent at {fire_time:.6f}")
+            self.after(0, lambda r=r: self._status.config(text=f"第 {r}/{self._total} 轮 — 已发送", fg="#cc6600"))
+            time.sleep(1.0)
+
+        if self._capture:
+            self.after(0, lambda: self._status.config(text="正在停止 PktMon 并刷新抓包数据…", fg="#cc6600"))
+            self._capture.stop()
+
+        if self._running:
+            self._append("\n────────── 逐轮匹配 ──────────\n")
+        for r, fire_time in sent_rounds:
+            if not self._running:
+                break
+            delay_ms, _line = self._capture.packet_after(fire_time, 1.5) if self._capture else (None, None)
             if delay_ms is not None:
-                self._results.append(delay_ms)
                 tag = "计入" if r > self._drop else "热身"
+                if r > self._drop:
+                    self._results.append(delay_ms)
                 self._append(f"#{r:02d}: {delay_ms:6.1f}ms  ← {tag}\n")
             else:
                 detail = self._capture.diagnostic_summary() if self._capture else "抓包器不可用"
                 self._append(f"#{r:02d}: 未找到发送包（{detail}）\n")
-            time.sleep(1.0)
-        if self._capture: self._capture.stop()
         if self._running: self._show_summary()
         self._running = False
         self.after(0, lambda: (self._start_btn.config(state="normal"), self._stop_btn.config(state="disabled")))
 
     def _show_summary(self):
-        valid = self._results[self._drop:] if len(self._results) > self._drop else []
+        valid = list(self._results)
         if len(valid) < 2:
             self.after(0, lambda: self._conclusion.config(text="有效数据不足，请增加轮数或重新检测微信端口")); return
         avg = statistics.mean(valid); stdev = statistics.stdev(valid) if len(valid) > 1 else 0.0
