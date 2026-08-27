@@ -31,8 +31,6 @@ SYNC_INTERVAL = 30
 NTP_SAMPLES = 3
 
 SCRIPT_DIR = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-LOG_FILE = SCRIPT_DIR / "app_log.txt"
-_LOG_LOCK = threading.Lock()
 
 TEMPLATES = {
     "纯编号": "{numbers}",
@@ -41,18 +39,6 @@ TEMPLATES = {
     "我想要": "我想要 {numbers}",
     "老板": "老板 {numbers} 谢谢",
 }
-
-
-def _write_log(message: str) -> None:
-    """Append a timestamped diagnostic line beside the script/EXE."""
-    try:
-        stamp = datetime.now().astimezone().isoformat(timespec="milliseconds")
-        with _LOG_LOCK:
-            with LOG_FILE.open("a", encoding="utf-8") as log_file:
-                log_file.write(f"{stamp} {message.rstrip()}\n")
-    except Exception:
-        # Diagnostics must never break grabbing or calibration.
-        pass
 
 
 def _hidden_process_options() -> dict:
@@ -269,9 +255,8 @@ def _wechat_pids() -> set[int]:
                     pids.add(int(row[1]))
                 except ValueError:
                     pass
-    except Exception as exc:
-        _write_log(f"WECHAT tasklist failed: {exc!r}")
-    _write_log(f"WECHAT matched PIDs: {sorted(pids)}")
+    except Exception:
+        pass
     return pids
 
 
@@ -418,11 +403,9 @@ def get_wechat_ports() -> list[int]:
             m = re.search(r":(\d+)$", local)
             if m:
                 ports.add(int(m.group(1)))
-                _write_log(f"WECHAT netstat match: {line.strip()}")
-    except Exception as exc:
-        _write_log(f"WECHAT netstat failed: {exc!r}")
+    except Exception:
+        pass
     result = sorted(ports)
-    _write_log(f"WECHAT matched TCP ports: {result}")
     return result
 
 
@@ -449,10 +432,6 @@ class PacketCapture:
             ["pktmon", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=8, check=check
         )
-        _write_log(
-            f"PKTMON command={args!r} rc={result.returncode} "
-            f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}"
-        )
         return result
 
     def start(self):
@@ -472,7 +451,6 @@ class PacketCapture:
                 raise RuntimeError(f"添加 PktMon 端口过滤失败: {port}\n{r.stderr or r.stdout}")
 
         cmd = ["pktmon", "start", "--capture", "--comp", "nics", "--log-mode", "real-time", "--flags", "0x010"]
-        _write_log(f"PKTMON starting realtime capture: {cmd!r}; ports={self._ports}")
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             encoding="utf-8", errors="replace",
@@ -505,7 +483,6 @@ class PacketCapture:
         try:
             assert self._proc and self._proc.stdout
             for line in self._proc.stdout:
-                clean_line = line.rstrip()
                 ts = self._line_to_epoch(line)
                 with self._lock:
                     self._raw_line_count += 1
@@ -514,9 +491,8 @@ class PacketCapture:
                         self._lines.append((ts, line.rstrip()))
                         if len(self._lines) > 5000:
                             self._lines = self._lines[-3000:]
-                _write_log(f"PKTMON raw parsed={ts is not None}: {clean_line[:2000]}")
-        except Exception as exc:
-            _write_log(f"PKTMON reader failed: {exc!r}")
+        except Exception:
+            pass
 
     def diagnostic_summary(self) -> str:
         with self._lock:
@@ -544,30 +520,23 @@ class PacketCapture:
                 and self._is_tx_line(line)
             ]
         if not candidates:
-            _write_log(
-                f"PKTMON no Tx packet for send_ts={since_ts:.6f}; "
-                f"packet_window={packet_window:.3f}s; {self.diagnostic_summary()}"
-            )
             return None, None
         ts, line = min(candidates, key=lambda item: item[0])
         delay_ms = (ts - since_ts) * 1000.0
-        _write_log(f"PKTMON matched send_ts={since_ts:.6f}; delay_ms={delay_ms:.3f}; line={line}")
         return delay_ms, line
 
     def stop(self):
         with self._stop_lock:
             if self._stopped:
                 return
-            _write_log(f"PKTMON stopping and flushing; {self.diagnostic_summary()}")
             try:
                 self._run_pktmon(["stop"], check=False)
-            except Exception as exc:
-                _write_log(f"PKTMON stop command failed: {exc!r}")
+            except Exception:
+                pass
             if self._proc:
                 try:
                     self._proc.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    _write_log("PKTMON realtime process did not exit after stop; terminating")
                     self._proc.terminate()
                     try:
                         self._proc.wait(timeout=2)
@@ -577,9 +546,8 @@ class PacketCapture:
                 self._reader_thread.join(timeout=3)
             try:
                 self._run_pktmon(["filter", "remove"], check=False)
-            except Exception as exc:
-                _write_log(f"PKTMON filter cleanup failed: {exc!r}")
-            _write_log(f"PKTMON flush complete; {self.diagnostic_summary()}")
+            except Exception:
+                pass
             self._proc = None
             self._stopped = True
 
@@ -774,10 +742,6 @@ class GrabberTab(ttk.Frame):
     def _log(self, msg: str):
         now_str = self.time_mgr.format_now()
         line = f"[{now_str}] {msg}\n"
-        try:
-            with LOG_FILE.open("a", encoding="utf-8") as f: f.write(line)
-        except Exception:
-            pass
         def write():
             self._logbox.config(state="normal"); self._logbox.insert("end", line); self._logbox.see("end"); self._logbox.config(state="disabled")
         self.after(0, write)
@@ -887,14 +851,11 @@ class CalibrateTab(ttk.Frame):
             messagebox.showwarning("提示", "测试轮数格式错误"); return
         self._results = []; self._recommended_ms = 0; self._running = True
         self._result_text.delete("1.0", "end")
-        _write_log("=" * 20 + " calibration session started " + "=" * 20)
-        _write_log(f"APP executable={sys.executable!r}; log={str(LOG_FILE)!r}")
         self._result_text.insert(
             "end",
             f"抓包测试 {self._total} 轮（前 {self._drop} 轮热身）\n"
             f"监控端口: {', '.join(map(str, self._wechat_ports))}\n"
-            f"抓包后端: Windows 内置 PktMon\n"
-            f"诊断日志: {LOG_FILE}\n\n",
+            f"抓包后端: Windows 内置 PktMon\n\n",
         )
         self._start_btn.config(state="disabled"); self._stop_btn.config(state="normal")
         self._copy_btn.config(state="disabled"); self._apply_btn.config(state="disabled")
@@ -912,9 +873,7 @@ class CalibrateTab(ttk.Frame):
             if not self._running: break
             current_ports = get_wechat_ports()
             if set(current_ports) != set(self._wechat_ports):
-                _write_log(
-                    f"ROUND {r}: TCP ports changed; capture={self._wechat_ports}, current={current_ports}"
-                )
+                self._append(f"#{r:02d}: 检测到微信端口变化，请结束后重新检测\n")
             self.after(0, lambda r=r: self._status.config(text=f"第 {r}/{self._total} 轮", fg="#007700"))
             target_go = time.time() + 3.0
             while self._running and time.time() < target_go:
@@ -929,7 +888,6 @@ class CalibrateTab(ttk.Frame):
             except Exception as e:
                 self._append(f"#{r:02d}: 发送失败: {e}\n"); continue
             sent_rounds.append((r, fire_time))
-            _write_log(f"ROUND {r}: message sent at {fire_time:.6f}")
             self.after(0, lambda r=r: self._status.config(text=f"第 {r}/{self._total} 轮 — 已发送", fg="#cc6600"))
             time.sleep(1.0)
 
