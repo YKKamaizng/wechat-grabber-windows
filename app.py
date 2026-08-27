@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import ctypes.wintypes
+from ctypes import wintypes
 import json
 import os
 import platform
