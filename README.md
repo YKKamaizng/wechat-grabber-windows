@@ -13,7 +13,7 @@
 
 2. **Windows 抓包改用系统内置 PktMon**
    - 不再依赖 WinDump/tcpdump/Npcap；
-   - 自动检测 `WeChat.exe`、`WeChatApp.exe`、`Weixin.exe`；
+   - 自动检测 `WeChat.exe`、`WeChatApp.exe`、`WeChatAppEx.exe`、`Weixin.exe`；
    - 根据微信进程 PID 从 `netstat` 获取当前 TCP 端口；
    - 只在“校准”时请求管理员权限；
    - 使用 PktMon 按微信端口过滤并实时捕获；

@@ -41,6 +41,17 @@ TEMPLATES = {
 }
 
 
+def _hidden_process_options() -> dict:
+    """Return Windows subprocess options that prevent console-window flashes."""
+    options = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    if SYSTEM == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        options["startupinfo"] = startupinfo
+    return options
+
+
 def fetch_ntp_time(timeout: float = 1.0) -> tuple[float, float]:
     """Return (unix_time, rtt_seconds)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -201,12 +212,14 @@ def _win_copy_clipboard(text: str) -> None:
 def _wechat_pids() -> set[int]:
     if SYSTEM != "Windows":
         return set()
-    names = {"wechat.exe", "wechatapp.exe", "weixin.exe"}
+    # WeChat 4.x moves much of its work, including networking, into
+    # WeChatAppEx.exe child processes. Keep the older names for compatibility.
+    names = {"wechat.exe", "wechatapp.exe", "wechatappex.exe", "weixin.exe"}
     pids: set[int] = set()
     try:
         out = subprocess.check_output(
             ["tasklist", "/FO", "CSV", "/NH"], text=True, errors="ignore",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5
+            timeout=5, **_hidden_process_options()
         )
         for row in csv.reader(out.splitlines()):
             if len(row) >= 2 and row[0].lower() in names:
@@ -343,7 +356,7 @@ def get_wechat_ports() -> list[int]:
     try:
         out = subprocess.check_output(
             ["netstat", "-ano", "-p", "tcp"], text=True, errors="ignore",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5
+            timeout=5, **_hidden_process_options()
         )
         for line in out.splitlines():
             parts = line.split()
@@ -682,6 +695,8 @@ class CalibrateTab(ttk.Frame):
         self._recommended_ms = 0
         self._wechat_ports: list[int] = []
         self._capture: PacketCapture | None = None
+        self._detecting_ports = False
+        self._start_after_detection = False
         self._build_ui()
         self._detect_ports()
         self._tick()
@@ -695,7 +710,8 @@ class CalibrateTab(ttk.Frame):
         r = ttk.Frame(settings); r.pack(fill="x", padx=8, pady=4)
         ttk.Label(r, text="抓包端口：").pack(side="left")
         self._port_label = tk.Label(r, text="检测中…", fg="gray"); self._port_label.pack(side="left", fill="x", expand=True)
-        ttk.Button(r, text="重新检测", command=self._detect_ports).pack(side="right")
+        self._detect_btn = ttk.Button(r, text="重新检测", command=self._detect_ports)
+        self._detect_btn.pack(side="right")
 
         r = ttk.Frame(settings); r.pack(fill="x", padx=8, pady=4)
         self._rounds_var = tk.StringVar(value="10"); self._drop_var = tk.StringVar(value="2"); self._msg_var = tk.StringVar(value="测")
@@ -725,12 +741,34 @@ class CalibrateTab(ttk.Frame):
         dt = self.time_mgr.now_datetime(); self._clock.config(text=dt.strftime("%H:%M:%S.") + f"{dt.microsecond//1000:03d}")
         self.after(20, self._tick)
 
-    def _detect_ports(self):
-        self._wechat_ports = get_wechat_ports()
-        if self._wechat_ports:
-            self._port_label.config(text=", ".join(map(str, self._wechat_ports)), fg="green")
-        else:
-            self._port_label.config(text="未检测到（请打开并登录 Windows 微信/Weixin）", fg="red")
+    def _detect_ports(self, start_after: bool = False):
+        if start_after:
+            self._start_after_detection = True
+        if self._detecting_ports:
+            return
+        self._detecting_ports = True
+        self._port_label.config(text="检测中…", fg="gray")
+        self._detect_btn.config(state="disabled")
+        self._start_btn.config(state="disabled")
+
+        def worker():
+            ports = get_wechat_ports()
+            self.after(0, lambda: finish(ports))
+
+        def finish(ports: list[int]):
+            self._wechat_ports = ports
+            self._detecting_ports = False
+            self._detect_btn.config(state="normal")
+            self._start_btn.config(state="normal")
+            if ports:
+                self._port_label.config(text=", ".join(map(str, ports)), fg="green")
+            else:
+                self._port_label.config(text="未检测到（请打开并登录 Windows 微信/Weixin）", fg="red")
+            if self._start_after_detection:
+                self._start_after_detection = False
+                self._start_with_detected_ports()
+
+        threading.Thread(target=worker, daemon=True, name="wechat-port-detect").start()
 
     def _start(self):
         if not is_admin():
@@ -738,7 +776,9 @@ class CalibrateTab(ttk.Frame):
                 if relaunch_as_admin_calibrate():
                     self.master.winfo_toplevel().after(300, self.master.winfo_toplevel().destroy)
             return
-        self._detect_ports()
+        self._detect_ports(start_after=True)
+
+    def _start_with_detected_ports(self):
         if not self._wechat_ports:
             messagebox.showwarning("提示", "未检测到微信连接，请打开微信、登录，并让微信保持联网后重试")
             return
