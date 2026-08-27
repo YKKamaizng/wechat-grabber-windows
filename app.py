@@ -443,7 +443,7 @@ class PacketCapture:
 
     def _run_pktmon(self, args: list[str], check=True):
         result = subprocess.run(
-            ["pktmon", *args], capture_output=True, text=True, errors="ignore",
+            ["pktmon", *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=8, check=check
         )
         _write_log(
@@ -471,7 +471,8 @@ class PacketCapture:
         cmd = ["pktmon", "start", "--capture", "--comp", "nics", "--log-mode", "real-time", "--flags", "0x010"]
         _write_log(f"PKTMON starting realtime capture: {cmd!r}; ports={self._ports}")
         self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore",
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
             bufsize=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         threading.Thread(target=self._read, daemon=True, name="pktmon-reader").start()
@@ -523,20 +524,28 @@ class PacketCapture:
             return f"PktMon 有 {raw_count} 行输出但时间戳均未识别"
         return f"PktMon 原始 {raw_count} 行，已解析 {parsed_count} 行"
 
-    def first_packet_after(self, since_ts: float, max_delay: float = 1.5) -> tuple[float | None, str | None]:
-        deadline = time.time() + max_delay
+    def first_packet_after(
+        self,
+        since_ts: float,
+        packet_window: float = 1.5,
+        output_wait: float = 15.0,
+    ) -> tuple[float | None, str | None]:
+        # PktMon can buffer redirected real-time output for several seconds.
+        # Wait for that output without widening the valid packet-time window.
+        deadline = time.time() + output_wait
         while time.time() < deadline:
             with self._lock:
                 candidates = [(ts, line) for ts, line in self._lines if ts >= since_ts - 0.005]
             if candidates:
                 ts, line = min(candidates, key=lambda x: x[0])
                 delay_ms = (ts - since_ts) * 1000.0
-                if -5 <= delay_ms <= max_delay * 1000:
+                if -5 <= delay_ms <= packet_window * 1000:
                     return delay_ms, line
             time.sleep(0.02)
         _write_log(
             f"PKTMON no packet after send_ts={since_ts:.6f}; "
-            f"timeout={max_delay:.3f}s; {self.diagnostic_summary()}"
+            f"packet_window={packet_window:.3f}s; output_wait={output_wait:.3f}s; "
+            f"{self.diagnostic_summary()}"
         )
         return None, None
 
@@ -544,11 +553,13 @@ class PacketCapture:
         _write_log(f"PKTMON stopping; {self.diagnostic_summary()}")
         try:
             subprocess.run(["pktmon", "stop"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
         except Exception:
             pass
         try:
             subprocess.run(["pktmon", "filter", "remove"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5)
         except Exception:
             pass
